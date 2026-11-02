@@ -1,0 +1,100 @@
+# GPU-вариант: docker compose -f docker-compose.gpu.yml up -d
+# or: docker-compose -f docker-compose.gpu.yml up -d
+version: '3.8'
+# Требования на хосте: NVIDIA-драйвер + nvidia-container-toolkit
+# Для cu128-образа нужен драйвер ветки 570+ (см. "CUDA Version" в выводе nvidia-smi).
+# (проверка: docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi)
+services:
+  docling:
+    build:
+      context: .
+      dockerfile: Dockerfile.gpu
+      args:
+        # H100 (Hopper, sm_90) поддерживается обоими: cu128 и cu130.
+        # Выбирайте по драйверу хоста: cu128 -> драйвер 570+, cu130 -> 580+.
+        BASE_IMAGE: "${DOCLING_GPU_IMAGE:-quay.io/docling-project/docling-serve-cu128:v1.32.0}"
+    container_name: docling-serve-gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+              # Одна H100 — достаточно count: all.
+              # Если карт несколько и нужна конкретная: уберите count, добавьте device_ids: ['0']
+              count: all
+    # PyTorch/DataLoader обмениваются батчами через /dev/shm;
+    # дефолтные 64 МБ мало — при параллельных воркерах ловится "Bus error"
+    shm_size: "${DOCLING_SHM_SIZE:-8g}"
+    ports:
+      - "${DOCLING_PORT:-5001}:5001"
+    environment:
+      DOCLING_SERVE_ENABLE_UI: "${DOCLING_SERVE_ENABLE_UI:-0}"
+      # Макс. ожидание синхронной конвертации (сек); большие PDF идут дольше 120
+      DOCLING_SERVE_MAX_SYNC_WAIT: "${DOCLING_SERVE_MAX_SYNC_WAIT:-600}"
+      # Параллельные воркеры локального движка (дефолт docling-serve — 2).
+      # Каждый воркер держит свою копию моделей в VRAM (~1-2 GB);
+      # на H100 80 GB запаса хватает — поднимаем до 4 для параллельной обработки
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "${DOCLING_SERVE_ENG_LOC_NUM_WORKERS:-4}"
+      # Потоки CPU на препроцессинг страниц до отправки на GPU
+      OMP_NUM_THREADS: "${OMP_NUM_THREADS:-8}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5001/health').status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+
+  # HTTP-прокси: обход бага docling-serve#567 (multipart игнорирует OCR-опции).
+  # Наружу — тот же API, что у docling, но ocr_engine/ocr_lang работают.
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.proxy
+    container_name: docling-proxy-gpu
+    depends_on:
+      docling:
+        condition: service_healthy
+    ports:
+      - "${PROXY_PORT:-5002}:5002"
+    environment:
+      DOCLING_URL: "http://docling-serve-gpu-2:5001"
+      # OCR по умолчанию для запросов без явных ocr_engine/ocr_lang:
+      # RapidOCR PP-OCR v5 «eslav» (ru/uk/be + en одной моделью)
+      OCR_ENGINE: "${OCR_ENGINE:-rapidocr}"
+      OCR_LANG: "${OCR_LANG:-eslav}"
+    restart: unless-stopped
+
+
+  # MCP-сервер для агентов: streamable-http на http://<host>:${MCP_PORT:-8000}/mcp
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: docling-mcp-gpu
+    depends_on:
+      docling:
+        condition: service_healthy
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      # Внутри сети compose docling доступен по имени сервиса
+      DOCLING_URL: "http://docling-serve-gpu-2:5001"
+      # Таймаут ожидания конвертации, сек
+      DOCLING_POLL_TIMEOUT: "${DOCLING_POLL_TIMEOUT:-1800}"
+      # Макс. размер тела запроса к MCP, МБ (base64 PDF; дефолт SDK — 4 МБ)
+      MCP_MAX_BODY_MB: "${MCP_MAX_BODY_MB:-64}"
+      # OCR по умолчанию (см. proxy выше)
+      OCR_ENGINE: "${OCR_ENGINE:-rapidocr}"
+      OCR_LANG: "${OCR_LANG:-eslav}"
+    restart: unless-stopped
+
+networks:
+  default:
+    external: true
+    name: langflow-v2_default

@@ -1,0 +1,65 @@
+# Docling offline stack — secure environment
+# Prereqs: docker + docker compose plugin, nvidia-container-toolkit, driver >= 550 (cu126)
+# Run from package root after load_images.sh
+services:
+  docling-serve:
+    image: docling-serve-cu126:offline
+    container_name: docling-serve-offline
+    runtime: nvidia
+    shm_size: "8g"
+    environment:
+      DOCLING_SERVE_ARTIFACTS_PATH: /opt/app-root/src/.cache/docling/models
+      DOCLING_SERVE_ENABLE_UI: "0"
+      DOCLING_SERVE_ENG_LOC_NUM_WORKERS: "4"
+      DOCLING_SERVE_LOAD_MODELS_AT_BOOT: "false"
+      DOCLING_SERVE_MAX_SYNC_WAIT: "600"
+      DOCLING_SERVE_ALLOW_CUSTOM_PICTURE_DESCRIPTION_CONFIG: "true"
+      DOCLING_SERVE_ENABLE_REMOTE_SERVICES: "true"
+      CUDA_VISIBLE_DEVICES: ""
+      OMP_NUM_THREADS: "4"
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    volumes:
+      - ./models/models:/opt/app-root/src/.cache/docling/models
+    ports:
+      - "5001:5001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5001/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    restart: unless-stopped
+
+  # OCR-bug workaround proxy (docling-serve#567): multipart with working ocr_engine/ocr_lang
+  docling-proxy:
+    image: docling-proxy:offline
+    container_name: docling-proxy-offline
+    depends_on:
+      docling-serve:
+        condition: service_healthy
+    environment:
+      DOCLING_URL: "http://docling-serve:5001"
+      OCR_ENGINE: "rapidocr"
+      OCR_LANG: "eslav"
+    ports:
+      - "5002:5002"
+    restart: unless-stopped
+
+  # MCP server (streamable-http at /mcp)
+  docling-mcp:
+    image: docling-mcp:offline
+    container_name: docling-mcp-offline
+    depends_on:
+      docling-serve:
+        condition: service_healthy
+    environment:
+      DOCLING_URL: "http://docling-serve:5001"
+      OCR_ENGINE: "rapidocr"
+      OCR_LANG: "eslav"
+      MCP_MAX_BODY_MB: "64"
+      DOCLING_POLL_TIMEOUT: "1800"
+    ports:
+      - "8000:8000"
+    restart: unless-stopped

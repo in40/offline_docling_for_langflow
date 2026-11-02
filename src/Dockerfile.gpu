@@ -1,0 +1,38 @@
+# Docling в режиме сервера на GPU (CUDA).
+# ВНИМАНИЕ: у CUDA-образов нет тега latest — только явные версии и main.
+#
+# Вариант базового образа можно переопределить при сборке:
+#   docker compose -f docker-compose.gpu.yml build --build-arg BASE_IMAGE=quay.io/docling-project/docling-serve-cu130:v1.32.0
+# cu128 — для драйверов с CUDA 12.8, cu130 — для CUDA 13.0 (см. `nvidia-smi` на сервере).
+ARG BASE_IMAGE=quay.io/docling-project/docling-serve-cu128:v1.32.0
+FROM ${BASE_IMAGE}
+
+
+ENV DOCLING_SERVE_ENABLE_UI=0
+
+
+# --- Поддержка кириллицы ---------------------------------------------------
+# Базовый образ (CentOS Stream 9, dnf) содержит Tesseract только с eng.
+# Доставляем русский языковой пакет (движки tesseract / tesserocr).
+USER 0
+RUN dnf install -y --best --nodocs --setopt=install_weak_deps=False \
+        tesseract-langpack-rus \
+    && dnf -y clean all \
+    && rm -rf /var/cache/dnf
+USER 1001
+
+
+# Предзагрузка OCR-моделей с русским языком (в дополнение к английским,
+# которые уже есть в базовом образе):
+#  - EasyOCR: ['ru','en'] -> распознаватель cyrillic_g2 (покрывает ru+en)
+#  - RapidOCR: onnxruntime:eslav -> PP-OCR v5, семейство
+#    «русский/белорусский/украинский + английский» одной моделью
+# Оба движка выбираются на уровне запроса (ocr_engine/ocr_lang), образ один.
+RUN docling-tools models download -o "${DOCLING_SERVE_ARTIFACTS_PATH}" \
+        easyocr --easyocr-lang ru --easyocr-lang en \
+    && docling-tools models download -o "${DOCLING_SERVE_ARTIFACTS_PATH}" \
+        rapidocr --rapidocr-backend-lang onnxruntime:eslav
+# ---------------------------------------------------------------------------
+
+
+EXPOSE 5001
